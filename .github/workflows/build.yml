@@ -48,7 +48,7 @@ jobs:
           }
           EOT
           [ -f AndroidManifest.xml ] && mv -f AndroidManifest.xml app/src/main/AndroidManifest.xml || true
-          for k in MainActivity RecService ScreenRecorder; do
+          for k in MainActivity RecService ScreenRecorder VideoExporter; do
             [ -f $k.kt ] && mv -f $k.kt app/src/main/java/com/linedist/app/$k.kt || true
           done
           [ -f index.html ] && mv -f index.html app/src/main/assets/index.html || true
@@ -56,7 +56,8 @@ jobs:
           for f in app/src/main/AndroidManifest.xml app/src/main/assets/index.html \
                    app/src/main/java/com/linedist/app/MainActivity.kt \
                    app/src/main/java/com/linedist/app/RecService.kt \
-                   app/src/main/java/com/linedist/app/ScreenRecorder.kt; do
+                   app/src/main/java/com/linedist/app/ScreenRecorder.kt \
+                   app/src/main/java/com/linedist/app/VideoExporter.kt; do
             if [ ! -f "$f" ]; then echo "::error::MISSING FILE: $f"; missing=1; fi
           done
           exit $missing
