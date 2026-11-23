@@ -2897,6 +2897,7 @@ function triggerVideo(e) { if(e) e.preventDefault(); document.getElementById('vi
 function triggerAudio(e) { if(e) e.preventDefault(); document.getElementById('audio-upload').click(); }
 function handleVideo(input) {
 const file = input.files[0];
+try{window.__srcV=file?{name:file.name,size:file.size}:null;}catch(e){}
 if (file) {
 const url = URL.createObjectURL(file);
 const v = document.getElementById('bg-video');
@@ -2909,6 +2910,7 @@ ensureAudioAnalyser(v);
 }
 function handleAudio(input) {
 const file = input.files[0];
+try{window.__srcA=file?{name:file.name,size:file.size}:null;}catch(e){}
 if (file) {
 const url = URL.createObjectURL(file);
 const a = document.getElementById('bg-audio');
@@ -4507,7 +4509,9 @@ const a = document.getElementById('bg-audio');
 const titleHeader = document.getElementById('title-header');
 const playingEl = (v.src && !v.paused) ? v : (a.src && !a.paused) ? a : null;
 const liveMedia = (v.src && !v.paused && !v.ended && v.readyState >= 3) ? v : (a.src && !a.paused && !a.ended && a.readyState >= 3) ? a : null;
-if (liveMedia) {
+if (window.__expT!=null) {
+playheadPx = Math.max(0, (window.__expT + syncOffsetMs / 1000) * pxPerSec);
+} else if (liveMedia) {
 // lock the playhead to the media's real clock (plus a tiny extrapolation between the
 // browser's coarse currentTime updates) so the distribution starts exactly with the audio/video
 const ct = liveMedia.currentTime;
@@ -7250,7 +7254,7 @@ var g2=akCh('bgfx','ANIMATED BACKGROUND (when no video is loaded)',[['none','NON
 var g3=akCh('frame','FRAME STYLE',[['sides','SIDE LINES'],['box','BOX'],['corners','CORNERS'],['dashed','DASHED'],['double','DOUBLE'],['neon','NEON'],['gradient','GRADIENT'],['off','NONE']])+akSl('frad')+H('THICKNESS / COLOR / SPACING: BORDER STYLE BUTTON.');
 h+=akGrp('bg','\uD83C\uDFAC BACKGROUND + FRAME',akSec('BACKGROUND VIDEO (MP4) + AUDIO',g1)+akSec('ANIMATED BACKGROUND + FALLING SPARKLES',g2)+akSec('FRAME / BORDER',g3));
 // ---- TOOLS ----
-h+=akGrp('tools','\uD83D\uDEE0 TOOLS + SPEED',akSec('SPEED, SCREEN + GUIDES',akTg(['lite','autolite','wake','safezone','trail'])+BTN('\u26F6 FULLSCREEN','akFull()'))+akSec('RECORD / EXPORT VIDEO',BTN('\u25CF REC MODE (PHONE: GUIDED RECORDING)','akFxClose();akRecMode()')+BTN('\u2B07 EXPORT VIDEO (MP4)','akFxClose();akExportVideo()')+H('PHONE: START YOUR SCREEN RECORDER, THEN USE REC MODE. COMPUTER: EXPORT SAVES A VIDEO FILE OF THE REAL PAGE (SAME LOOK, ALL EFFECTS).')));
+h+=akGrp('tools','\uD83D\uDEE0 TOOLS + SPEED',akSec('SPEED, SCREEN + GUIDES',akTg(['lite','autolite','wake','safezone','trail'])+BTN('\u26F6 FULLSCREEN','akFull()'))+akSec('RECORD / EXPORT VIDEO',BTN('\u25CF REC MODE (PHONE: GUIDED RECORDING)','akFxClose();akRecMode()')+(window.AndroidRec&&AndroidRec.exportBegin?BTN('\u2B07 EXPORT VIDEO (MP4) - NO SCREEN RECORDING','akFxClose();akExportOffline()'):'')+BTN(window.AndroidRec?'\u25CF EXPORT (LIVE SCREEN CAPTURE)':'\u2B07 EXPORT VIDEO (MP4)','akFxClose();akExportVideo()')+H('PHONE: START YOUR SCREEN RECORDER, THEN USE REC MODE. COMPUTER: EXPORT SAVES A VIDEO FILE OF THE REAL PAGE (SAME LOOK, ALL EFFECTS).')));
 h+='<button onclick="akFxClose()" style="width:100%;background:#ff9d1a;color:#000;border:none;padding:14px;font-weight:900;font-size:11px;letter-spacing:2px;border-radius:6px;margin-top:10px;">DONE</button>';
 h+='<button onclick="akFxReset()" style="width:100%;background:transparent;color:#ff4444;border:1px solid #ff4444;padding:10px;font-weight:900;font-size:9px;letter-spacing:1px;border-radius:6px;">RESET ALL STYLE STUDIO SETTINGS</button>';
 document.getElementById('fx-body').innerHTML=h;
@@ -7346,5 +7350,89 @@ akRunTake(function(){setTimeout(function(){if(rec.state!=='inactive')rec.stop();
 akFxApply();
 </script>
 
+<script>
+/* ===== OFFLINE MP4 EXPORT (Android app): renders the page frame by frame on a virtual clock ===== */
+(function(){
+var _pn=performance.now.bind(performance),_dn=Date.now,_base=0,_dbase=0;
+window.__vt=null;window.__expT=null;window.__expLvl=0;window.__expBusy=false;window.__expAbort=null;
+performance.now=function(){return window.__vt==null?_pn():_base+window.__vt;};
+Date.now=function(){return window.__vt==null?_dn():_dbase+window.__vt;};
+var _gfs=getFullSpectrumLevel;
+getFullSpectrumLevel=function(){return window.__expT!=null?window.__expLvl:_gfs();};
+var _frameRes=null,_beginRes=null,_finRes=null;
+window.__expFrameDone=function(){var r=_frameRes;_frameRes=null;if(r)r();};
+window.__expBegun=function(csv){var r=_beginRes;_beginRes=null;if(r)r(csv);};
+window.__expFinished=function(ok,msg){var r=_finRes;_finRes=null;if(r)r({ok:ok,msg:msg});};
+window.__expFail=function(m){
+window.__expAbort=m||'ERROR';
+var r=_frameRes;_frameRes=null;if(r)r();
+var b=_beginRes;_beginRes=null;if(b)b(null);
+var f=_finRes;_finRes=null;if(f)f({ok:false,msg:m});
+};
+function raf(){return new Promise(function(r){requestAnimationFrame(function(){r();});});}
+function seek(el,t){return new Promise(function(res){
+if(!el||!el.src||!isFinite(el.duration)){res();return;}
+var d=false;function fin(){if(d)return;d=true;el.removeEventListener('seeked',fin);res();}
+var tt=Math.min(Math.max(0,t),Math.max(0,el.duration-0.04));
+if(Math.abs(el.currentTime-tt)<0.001){res();return;}
+el.addEventListener('seeked',fin);el.currentTime=tt;setTimeout(fin,1500);
+});}
+function stepAnims(vt){
+var an;try{an=document.getAnimations();}catch(e){return;}
+for(var i=0;i<an.length;i++){var x=an[i];
+try{if(x.__s===undefined)x.__s=vt;x.pause();x.currentTime=vt-x.__s;}catch(e){}
+}
+}
+window.akExportOffline=async function(){
+if(!(window.AndroidRec&&AndroidRec.exportBegin)){return akExportVideo();}
+if(window.__expBusy||akTakeBusy)return;
+if(!members.length){alert('ADD MEMBERS FIRST.');return;}
+if(!(akTotal()>1)){alert('NOTHING TO PLAY YET: LOAD A VIDEO OR RECORD LINES FIRST.');return;}
+window.__expBusy=true;window.__expAbort=null;
+var FPS=30,v=document.getElementById('bg-video'),a=document.getElementById('bg-audio');
+var tot=akTotal();
+var holdS=akFx.endscr?Math.min(30,Math.max(3,(akFx.endhold||12))):0.8;
+var srcs=[];
+if(a&&a.src&&window.__srcA)srcs.push(window.__srcA);
+if(v&&v.src&&window.__srcV)srcs.push(window.__srcV);
+var wasHide=hideUIOn,oldLoop=v?v.loop:true,wasWake=akFx.wake,ok=true,msg='';
+try{if(!hideUIOn)toggleHideUI();}catch(e){}
+try{stopVid();if(akEndShown)akHideEnd();if(v&&v.src){v.loop=false;v.muted=true;}if(a&&a.src){a.muted=true;}playheadPx=0;updatePlayheadUI();}catch(e){}
+try{
+var csv=await new Promise(function(res){_beginRes=res;AndroidRec.exportBegin(JSON.stringify({fps:FPS,total:tot+holdS,audioLen:tot,srcs:srcs}));});
+if(window.__expAbort)throw new Error(window.__expAbort);
+var lv=csv?csv.split(','):[];
+_base=_pn();_dbase=_dn();window.__vt=0;window.__expT=0;isPlaying=true;
+var N=Math.ceil((tot+holdS)*FPS),ended=false;
+for(var n=0;n<N;n++){
+if(window.__expAbort)throw new Error(window.__expAbort);
+var t=n/FPS;window.__vt=t*1000;
+var tm=Math.min(t,tot);window.__expT=tm;
+window.__expLvl=(parseInt(lv[n],10)||0)/100;
+if(t>=tot&&!ended){ended=true;isPlaying=false;try{if(akFx.endscr&&!akEndShown)akShowEnd(true);}catch(e){}}
+if(!ended&&v&&v.src)await seek(v,tm);
+await raf();
+stepAnims(window.__vt);
+await raf();
+await raf();
+await new Promise(function(res){_frameRes=res;AndroidRec.exportFrame(n,N);});
+}
+if(window.__expAbort)throw new Error(window.__expAbort);
+var fr=await new Promise(function(res){_finRes=res;AndroidRec.exportEnd();});
+ok=fr.ok;msg=fr.msg||'';
+}catch(e){ok=false;msg=(e&&e.message)||String(e);try{AndroidRec.exportCancel();}catch(_){}}
+window.__vt=null;window.__expT=null;isPlaying=false;
+try{document.getAnimations().forEach(function(x){try{x.__s=undefined;x.play();}catch(e){}});}catch(e){}
+try{if(akEndShown)akHideEnd();}catch(e){}
+try{if(v){v.loop=oldLoop;v.muted=false;if(v.src)v.currentTime=0;}if(a){a.muted=false;if(a.src)a.currentTime=0;}}catch(e){}
+try{if(!wasHide&&hideUIOn)toggleHideUI();}catch(e){}
+try{akFx.wake=wasWake;akWake();}catch(e){}
+try{playheadPx=0;updatePlayheadUI();}catch(e){}
+window.__expBusy=false;
+if(ok)akToast('\u2714 MP4 SAVED: GALLERY > MOVIES > LINEDISTRIBUTION');
+else alert('EXPORT FAILED: '+msg);
+};
+})();
+</script>
 </body>
 </html>
