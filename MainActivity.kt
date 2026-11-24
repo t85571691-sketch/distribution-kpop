@@ -142,7 +142,7 @@ class MainActivity : Activity() {
                 }
             }
         }
-        @JavascriptInterface fun exportFrame(n: Int, total: Int) { exporter?.frame(n, total) }
+        @JavascriptInterface fun exportFrame(n: Int, total: Int, ptsMs: Double) { exporter?.frame(n, total, ptsMs) }
         @JavascriptInterface fun exportEnd() { exporter?.finish() }
         @JavascriptInterface fun exportCancel() { exporter?.cancel(); exporter = null }
     }

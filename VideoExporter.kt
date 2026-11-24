@@ -15,6 +15,7 @@ import android.os.HandlerThread
 import android.provider.MediaStore
 import android.util.Log
 import android.view.PixelCopy
+import android.view.Surface
 import android.widget.Toast
 import org.json.JSONObject
 import java.io.File
@@ -26,9 +27,10 @@ import java.util.Locale
 class Picked(val uri: Uri, val name: String, val size: Long)
 
 /**
- * Offline export: the page is stepped on a virtual clock, every frame is copied from the window
- * with PixelCopy and encoded to H.264 with an exact timestamp. Audio is transcoded from the
- * original file, then both are remuxed into one MP4 and saved to the gallery.
+ * Offline export (fast path): the page is stepped on a virtual clock, each frame is copied from the
+ * window with PixelCopy (already scaled by the GPU) and drawn into the H.264 encoder's input surface,
+ * so the hardware encoder does the colour conversion. Timestamps are restored from our own frame list.
+ * Audio is transcoded from the original file; both are remuxed into one MP4 saved to the gallery.
  */
 class VideoExporter(
     private val act: Activity,
@@ -38,6 +40,7 @@ class VideoExporter(
 ) {
     private val TAG = "VideoExporter"
     private val fps = params.optInt("fps", 30)
+    private val hd = params.optString("quality", "fast") == "hd"
     private val audioLenUs = (params.optDouble("audioLen", 10.0) * 1_000_000).toLong()
     private val thread = HandlerThread("export").also { it.start() }
     private val handler = Handler(thread.looper)
@@ -49,26 +52,35 @@ class VideoExporter(
     private var w = 0
     private var h = 0
     private var enc: MediaCodec? = null
+    private var surf: Surface? = null
     private var vmux: MediaMuxer? = null
     private var vTrack = -1
     private var vStarted = false
     private var bmp: Bitmap? = null
-    private var px: IntArray = IntArray(0)
     private var hasAudio = false
     private var lastPts = 0L
     private var released = false
     @Volatile var failed: String? = null
 
+    // timestamp bookkeeping (frames posted to the encoder surface -> intended video time)
+    private val recTs = ArrayList<Long>()
+    private val recPts = ArrayList<Long>()
+    private var recPtr = 0
+    private var tsOffset = Long.MIN_VALUE
+
+    // stats
+    private var startNs = 0L
+    private var copyNs = 0L
+    private var encNs = 0L
+    private var frames = 0
+
     private fun fmt(width: Int, height: Int): MediaFormat {
         val f = MediaFormat.createVideoFormat("video/avc", width, height)
-        f.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+        f.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
         val br = (width.toLong() * height * fps * 0.15).toLong().coerceIn(2_000_000L, 20_000_000L).toInt()
         f.setInteger(MediaFormat.KEY_BIT_RATE, br)
         f.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
         f.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-        f.setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
-        f.setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
-        f.setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
         return f
     }
 
@@ -81,9 +93,17 @@ class VideoExporter(
                     Toast.makeText(act, "Exporting MP4... keep the app open and the screen on", Toast.LENGTH_LONG).show()
                 }
                 val dv = act.window.decorView
-                var tw = dv.width and 1.inv()
-                var th = dv.height and 1.inv()
+                var tw = dv.width
+                var th = dv.height
                 if (tw < 2 || th < 2) throw IllegalStateException("Window not ready")
+                if (!hd) {
+                    // FAST: shorter side 720 px (the GPU scales the copy, so it costs nothing extra)
+                    val sc = minOf(1.0, 720.0 / minOf(tw, th))
+                    tw = (tw * sc).toInt()
+                    th = (th * sc).toInt()
+                }
+                tw = tw and 1.inv()
+                th = th and 1.inv()
                 val list = MediaCodecList(MediaCodecList.REGULAR_CODECS)
                 var name: String? = null
                 while (true) {
@@ -96,11 +116,11 @@ class VideoExporter(
                 w = tw; h = th
                 val e = MediaCodec.createByCodecName(name!!)
                 e.configure(fmt(w, h), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                surf = e.createInputSurface()
                 e.start()
                 enc = e
                 vmux = MediaMuxer(tmpV.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
                 bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                px = IntArray(w * h)
 
                 // ---- audio: transcode original file to AAC + loudness envelope for the pulse effect ----
                 val env = ArrayList<Float>()
@@ -135,6 +155,7 @@ class VideoExporter(
                     val lvl = Math.sqrt((env[i] / p).toDouble()).toFloat().coerceAtMost(1f)
                     sb.append((lvl * 55).toInt())
                 }
+                startNs = System.nanoTime()
                 callJs("window.__expBegun&&window.__expBegun('" + sb.toString() + "')")
             } catch (t: Throwable) {
                 fail(t)
@@ -142,20 +163,26 @@ class VideoExporter(
         }
     }
 
-    fun frame(n: Int, total: Int) {
+    fun frame(n: Int, total: Int, ptsMs: Double) {
         val f = failed
         if (f != null) {
             callJs("window.__expFail&&window.__expFail(" + JSONObject.quote(f) + ")")
             return
         }
+        val ptsUs = (ptsMs * 1000.0).toLong()
         act.runOnUiThread {
             try {
+                val t0 = System.nanoTime()
                 PixelCopy.request(act.window, bmp!!, { res ->
                     try {
                         if (res != PixelCopy.SUCCESS) {
                             throw IllegalStateException("Screen copy error $res (keep the app open and the screen on)")
                         }
-                        encodeFrame(n)
+                        val t1 = System.nanoTime()
+                        copyNs += t1 - t0
+                        encodeFrame(ptsUs)
+                        encNs += System.nanoTime() - t1
+                        frames++
                         if (n % 15 == 0) progress(n, total)
                         callJs("window.__expFrameDone&&window.__expFrameDone()")
                     } catch (t: Throwable) {
@@ -168,69 +195,35 @@ class VideoExporter(
         }
     }
 
-    private fun encodeFrame(n: Int) {
-        val e = enc!!
-        bmp!!.getPixels(px, 0, w, 0, 0, w, h)
-        var idx = -1
-        var tries = 0
-        while (idx < 0) {
-            idx = e.dequeueInputBuffer(20_000)
-            drain(0, false)
-            if (++tries > 400) throw IllegalStateException("Encoder stalled")
+    private fun encodeFrame(ptsUs: Long) {
+        val sf = surf ?: throw IllegalStateException("No encoder surface")
+        val c = sf.lockCanvas(null)
+        try {
+            c.drawBitmap(bmp!!, 0f, 0f, null)
+        } finally {
+            sf.unlockCanvasAndPost(c)
         }
-        val img = e.getInputImage(idx) ?: throw IllegalStateException("No input image")
-        fillImage(img)
-        val pts = n * 1_000_000L / fps
-        lastPts = pts
-        e.queueInputBuffer(idx, 0, w * h * 3 / 2, pts, 0)
+        recTs.add(System.nanoTime() / 1000)
+        recPts.add(ptsUs)
+        lastPts = ptsUs
         drain(0, false)
     }
 
-    private fun fillImage(img: android.media.Image) {
-        val yP = img.planes[0]
-        val uP = img.planes[1]
-        val vP = img.planes[2]
-        val yb = yP.buffer
-        val ub = uP.buffer
-        val vb = vP.buffer
-        val ys = yP.rowStride
-        val us = uP.rowStride
-        val up = uP.pixelStride
-        val vs = vP.rowStride
-        val vpix = vP.pixelStride
-        val row0 = ByteArray(w)
-        val row1 = ByteArray(w)
-        var j = 0
-        while (j < h) {
-            val o0 = j * w
-            val o1 = (j + 1) * w
-            var i = 0
-            while (i < w) {
-                val a = px[o0 + i]
-                val b = px[o0 + i + 1]
-                val c = px[o1 + i]
-                val d = px[o1 + i + 1]
-                val ar = (a shr 16) and 255; val ag = (a shr 8) and 255; val ab = a and 255
-                val br = (b shr 16) and 255; val bg = (b shr 8) and 255; val bb = b and 255
-                val cr = (c shr 16) and 255; val cg = (c shr 8) and 255; val cb = c and 255
-                val dr = (d shr 16) and 255; val dg = (d shr 8) and 255; val db = d and 255
-                row0[i] = (((47 * ar + 157 * ag + 16 * ab) shr 8) + 16).toByte()
-                row0[i + 1] = (((47 * br + 157 * bg + 16 * bb) shr 8) + 16).toByte()
-                row1[i] = (((47 * cr + 157 * cg + 16 * cb) shr 8) + 16).toByte()
-                row1[i + 1] = (((47 * dr + 157 * dg + 16 * db) shr 8) + 16).toByte()
-                val r = (ar + br + cr + dr) shr 2
-                val g = (ag + bg + cg + dg) shr 2
-                val bl = (ab + bb + cb + db) shr 2
-                val u = (((-26 * r - 87 * g + 112 * bl) shr 8) + 128).coerceIn(0, 255)
-                val v = (((112 * r - 102 * g - 10 * bl) shr 8) + 128).coerceIn(0, 255)
-                ub.put((j shr 1) * us + (i shr 1) * up, u.toByte())
-                vb.put((j shr 1) * vs + (i shr 1) * vpix, v.toByte())
-                i += 2
-            }
-            yb.position(j * ys); yb.put(row0, 0, w)
-            yb.position((j + 1) * ys); yb.put(row1, 0, w)
-            j += 2
+    /** Map an encoder output timestamp back to the intended video time of the frame it belongs to. */
+    private fun mapPts(rawUs: Long): Long {
+        if (recPtr >= recTs.size) return lastPts
+        if (tsOffset == Long.MIN_VALUE) tsOffset = rawUs - recTs[recPtr]
+        val target = rawUs - tsOffset
+        var best = recPtr
+        var bestD = Math.abs(recTs[recPtr] - target)
+        var k = recPtr + 1
+        while (k < recTs.size && k <= recPtr + 3) {
+            val d = Math.abs(recTs[k] - target)
+            if (d < bestD) { bestD = d; best = k }
+            k++
         }
+        recPtr = best + 1
+        return recPts[best]
     }
 
     private fun drain(timeoutUs: Long, untilEos: Boolean) {
@@ -251,6 +244,7 @@ class VideoExporter(
             if (i >= 0) {
                 val buf = e.getOutputBuffer(i)!!
                 if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0 && info.size > 0 && vStarted) {
+                    info.presentationTimeUs = mapPts(info.presentationTimeUs)
                     buf.position(info.offset)
                     buf.limit(info.offset + info.size)
                     vmux!!.writeSampleData(vTrack, buf, info)
@@ -263,11 +257,15 @@ class VideoExporter(
 
     private fun progress(n: Int, total: Int) {
         try {
+            val t = total.coerceAtLeast(1)
+            val elapsedS = (System.nanoTime() - startNs) / 1e9
+            val left = if (n > 10) (elapsedS / n * (t - n)).toInt() else -1
+            val eta = if (left >= 0) " - about " + (left / 60) + " min " + (left % 60) + " s left" else ""
             val nt = Notification.Builder(act, "exp")
                 .setSmallIcon(android.R.drawable.presence_video_online)
                 .setContentTitle("Exporting MP4")
-                .setContentText((n * 100 / total.coerceAtLeast(1)).toString() + "%")
-                .setProgress(total, n, false)
+                .setContentText((n * 100 / t).toString() + "%" + eta)
+                .setProgress(t, n.coerceAtMost(t), false)
                 .setOngoing(true)
                 .build()
             nm.notify(2, nt)
@@ -278,16 +276,11 @@ class VideoExporter(
         handler.post {
             try {
                 val e = enc!!
-                var idx = -1
-                var tries = 0
-                while (idx < 0) {
-                    idx = e.dequeueInputBuffer(20_000)
-                    drain(0, false)
-                    if (++tries > 400) throw IllegalStateException("Encoder stalled at end")
-                }
-                e.queueInputBuffer(idx, 0, 0, lastPts + 1_000_000L / fps, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                e.signalEndOfInputStream()
                 drain(10_000, true)
                 e.stop(); e.release(); enc = null
+                try { surf?.release() } catch (_: Throwable) {}
+                surf = null
                 if (vStarted) vmux!!.stop()
                 vmux!!.release(); vmux = null
                 val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
@@ -295,8 +288,11 @@ class VideoExporter(
                 Remux.merge(tmpV, if (hasAudio) tmpA else null, out)
                 saveToGallery(out)
                 out.delete()
+                val fr = frames.coerceAtLeast(1)
+                val stats = "copy " + (copyNs / fr / 1_000_000) + "ms, encode " + (encNs / fr / 1_000_000) + "ms, " +
+                        w + "x" + h
                 cleanup()
-                callJs("window.__expFinished&&window.__expFinished(true,'')")
+                callJs("window.__expFinished&&window.__expFinished(true,'','" + stats + "')")
             } catch (t: Throwable) {
                 fail(t)
             }
@@ -320,8 +316,9 @@ class VideoExporter(
         released = true
         try { enc?.stop() } catch (_: Throwable) {}
         try { enc?.release() } catch (_: Throwable) {}
+        try { surf?.release() } catch (_: Throwable) {}
         try { vmux?.release() } catch (_: Throwable) {}
-        enc = null; vmux = null
+        enc = null; vmux = null; surf = null
         tmpV.delete(); tmpA.delete()
         try { nm.cancel(2) } catch (_: Throwable) {}
         bmp?.recycle(); bmp = null
