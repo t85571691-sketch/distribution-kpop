@@ -67,6 +67,7 @@ class VideoExporter(
     private val recPts = ArrayList<Long>()
     private var recPtr = 0
     private var tsOffset = Long.MIN_VALUE
+    private var lastWritten = -1L
 
     // stats
     private var startNs = 0L
@@ -184,7 +185,9 @@ class VideoExporter(
                         encNs += System.nanoTime() - t1
                         frames++
                         if (n % 15 == 0) progress(n, total)
+                        // tell the page it can go on, then flush the encoder in the background
                         callJs("window.__expFrameDone&&window.__expFrameDone()")
+                        drain(0, false)
                     } catch (t: Throwable) {
                         fail(t)
                     }
@@ -206,7 +209,6 @@ class VideoExporter(
         recTs.add(System.nanoTime() / 1000)
         recPts.add(ptsUs)
         lastPts = ptsUs
-        drain(0, false)
     }
 
     /** Map an encoder output timestamp back to the intended video time of the frame it belongs to. */
@@ -244,7 +246,10 @@ class VideoExporter(
             if (i >= 0) {
                 val buf = e.getOutputBuffer(i)!!
                 if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0 && info.size > 0 && vStarted) {
-                    info.presentationTimeUs = mapPts(info.presentationTimeUs)
+                    var pp = mapPts(info.presentationTimeUs)
+                    if (pp <= lastWritten) pp = lastWritten + 1000
+                    lastWritten = pp
+                    info.presentationTimeUs = pp
                     buf.position(info.offset)
                     buf.limit(info.offset + info.size)
                     vmux!!.writeSampleData(vTrack, buf, info)

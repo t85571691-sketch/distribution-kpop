@@ -7351,38 +7351,34 @@ akFxApply();
 </script>
 
 <script>
-/* ===== OFFLINE MP4 EXPORT (Android app): renders the page frame by frame on a virtual clock ===== */
+/* ===== FAST MP4 EXPORT (Android app): "slow-motion" capture with an adaptive time-dilated clock =====
+   The page runs normally (video plays, no seeking) but its clock runs at a rate r < 1.
+   Every 1/30 s of *page time* one frame is copied, so no frame is ever missed.
+   r adapts automatically: as high as the phone can sustain (up to real time). */
 (function(){
-var _pn=performance.now.bind(performance),_dn=Date.now,_base=0,_dbase=0;
-window.__vt=null;window.__expT=null;window.__expLvl=0;window.__expBusy=false;window.__expAbort=null;
-performance.now=function(){return window.__vt==null?_pn():_base+window.__vt;};
-Date.now=function(){return window.__vt==null?_dn():_dbase+window.__vt;};
+var _pn=performance.now.bind(performance),_dn=Date.now,_st=window.setTimeout.bind(window);
+var rate=1,last=0,vt=0,active=false,base=0,dbase=0;
+function adv(){var rn=_pn();vt+=(rn-last)*rate;last=rn;}
+performance.now=function(){if(!active)return _pn();adv();return base+vt;};
+Date.now=function(){if(!active)return _dn();adv();return dbase+vt;};
+window.setTimeout=function(f,d){
+var rest=Array.prototype.slice.call(arguments,2);
+return _st.apply(window,[f,(active&&d)?d/rate:d].concat(rest));
+};
+window.__expOn=false;window.__expT=null;window.__expLvl=0;window.__expBusy=false;window.__expAbort=null;
 var _gfs=getFullSpectrumLevel;
-getFullSpectrumLevel=function(){return window.__expT!=null?window.__expLvl:_gfs();};
-var _frameRes=null,_beginRes=null,_finRes=null;
-window.__expFrameDone=function(){var r=_frameRes;_frameRes=null;if(r)r();};
+getFullSpectrumLevel=function(){return window.__expOn?window.__expLvl:_gfs();};
+var _frameCb=null,_beginRes=null,_finRes=null;
+window.__expFrameDone=function(){var c=_frameCb;if(c)c();};
 window.__expBegun=function(csv){var r=_beginRes;_beginRes=null;if(r)r(csv);};
 window.__expFinished=function(ok,msg,stats){var r=_finRes;_finRes=null;if(r)r({ok:ok,msg:msg,stats:stats});};
 window.__expFail=function(m){
 window.__expAbort=m||'ERROR';
-var r=_frameRes;_frameRes=null;if(r)r();
 var b=_beginRes;_beginRes=null;if(b)b(null);
 var f=_finRes;_finRes=null;if(f)f({ok:false,msg:m});
+if(_frameCb)_frameCb();
 };
-function raf(){return new Promise(function(r){requestAnimationFrame(function(){r();});});}
-function seek(el,t){return new Promise(function(res){
-if(!el||!el.src||!isFinite(el.duration)){res();return;}
-var d=false;function fin(){if(d)return;d=true;el.removeEventListener('seeked',fin);res();}
-var tt=Math.min(Math.max(0,t),Math.max(0,el.duration-0.04));
-if(Math.abs(el.currentTime-tt)<0.001){res();return;}
-el.addEventListener('seeked',fin);el.currentTime=tt;setTimeout(fin,1500);
-});}
-function stepAnims(vt){
-var an;try{an=document.getAnimations();}catch(e){return;}
-for(var i=0;i<an.length;i++){var x=an[i];
-try{if(x.__s===undefined)x.__s=vt;x.pause();x.currentTime=vt-x.__s;}catch(e){}
-}
-}
+function sleep(ms){return new Promise(function(r){_st(r,ms);});}
 window.akExportOffline=async function(hd){
 if(!(window.AndroidRec&&AndroidRec.exportBegin)){return akExportVideo();}
 if(window.__expBusy||akTakeBusy)return;
@@ -7390,53 +7386,114 @@ if(!members.length){alert('ADD MEMBERS FIRST.');return;}
 if(!(akTotal()>1)){alert('NOTHING TO PLAY YET: LOAD A VIDEO OR RECORD LINES FIRST.');return;}
 window.__expBusy=true;window.__expAbort=null;
 var FPS=30,v=document.getElementById('bg-video'),a=document.getElementById('bg-audio');
+var hasV=!!(v&&v.src),hasA=!!(a&&a.src);
 var tot=akTotal();
 var holdS=akFx.endscr?Math.min(30,Math.max(3,(akFx.endhold||12))):0.8;
 var srcs=[];
-if(a&&a.src&&window.__srcA)srcs.push(window.__srcA);
-if(v&&v.src&&window.__srcV)srcs.push(window.__srcV);
-var wasHide=hideUIOn,oldLoop=v?v.loop:true,wasWake=akFx.wake,ok=true,msg='',stats='';
+if(hasA&&window.__srcA)srcs.push(window.__srcA);
+if(hasV&&window.__srcV)srcs.push(window.__srcV);
+var wasHide=hideUIOn,oldVLoop=v?v.loop:true,oldALoop=a?a.loop:true,wasWake=akFx.wake,ok=true,msg='',stats='';
 try{if(!hideUIOn)toggleHideUI();}catch(e){}
-try{stopVid();if(akEndShown)akHideEnd();if(v&&v.src){v.loop=false;v.muted=true;}if(a&&a.src){a.muted=true;}playheadPx=0;updatePlayheadUI();}catch(e){}
+try{stopVid();if(akEndShown)akHideEnd();if(hasV){v.loop=false;v.muted=true;}if(hasA){a.loop=false;a.muted=true;}playheadPx=0;updatePlayheadUI();}catch(e){}
 try{
 var csv=await new Promise(function(res){_beginRes=res;AndroidRec.exportBegin(JSON.stringify({fps:FPS,quality:hd?'hd':'fast',total:tot+holdS,audioLen:tot,srcs:srcs}));});
 if(window.__expAbort)throw new Error(window.__expAbort);
 var lv=csv?csv.split(','):[];
-_base=_pn();_dbase=_dn();window.__vt=0;window.__expT=0;isPlaying=true;
-/* full 30 fps while the song plays; the static end screen drops to 10 fps after 3 s (saves time) */
-var fastHold=Math.max(0,holdS-3);
-var N=Math.ceil((tot+Math.min(3,holdS))*FPS)+Math.ceil(fastHold*10);
-var t=0,idx=0,ended=false,wall0=_pn(),sSeek=0,sNative=0,endT=tot+holdS;
-while(t<endT-1e-6){
-if(window.__expAbort)throw new Error(window.__expAbort);
-window.__vt=t*1000;
-var tm=Math.min(t,tot);window.__expT=tm;
-window.__expLvl=(parseInt(lv[Math.round(t*FPS)],10)||0)/100;
-if(t>=tot&&!ended){ended=true;isPlaying=false;try{if(akFx.endscr&&!akEndShown)akShowEnd(true);}catch(e){}}
-/* the video seek runs in parallel with the render waits */
-var sp=null,spDone=true;
-if(!ended&&v&&v.src){spDone=false;sp=seek(v,tm).then(function(){spDone=true;});}
-await raf();
-stepAnims(window.__vt);
-await raf();
-await raf();
-if(sp){if(!spDone){var s0=_pn();await sp;sSeek+=_pn()-s0;await raf();}else{await sp;}}
-var n0=_pn();
-await new Promise(function(res){_frameRes=res;AndroidRec.exportFrame(idx,N,Math.round(t*1000));});
-sNative+=_pn()-n0;
-idx++;
-t+=(t>=tot+3)?0.1:1/FPS;
+/* rewind the media and wait until it really is at 0 */
+await new Promise(function(res){
+var el=hasV?v:(hasA?a:null);if(!el){res();return;}
+var d=false;function fin(){if(d)return;d=true;el.removeEventListener('seeked',fin);res();}
+if(el.currentTime<0.001){res();return;}
+el.addEventListener('seeked',fin);el.currentTime=0;_st(fin,2000);
+});
+if(hasV&&hasA){try{a.currentTime=0;}catch(e){}}
+var N=Math.ceil((tot+Math.min(3,holdS))*FPS)+Math.ceil(Math.max(0,holdS-3)*10);
+var rateMax=1.0,R0=0.6;
+var ended=false,endVt=0,idx=0,busy=false,skips=0,ticks=0,nextCap=0,prevEt=0,prevPrevEt=0,sCaptured=0;
+var tiEma=16.7,lastTickReal=_pn(),wall0=_pn(),lastEtMove=_pn(),lastEtSeen=-1,rateSum=0,rateN=0;
+_frameCb=function(){busy=false;};
+function setRate(r){
+adv();rate=r;
+try{if(hasV)v.playbackRate=r;if(hasA)a.playbackRate=r;}catch(e){}
 }
+function mediaT(){
+if(hasV)return v.currentTime;
+if(hasA)return a.currentTime;
+return vt/1000;
+}
+function exportTime(){return ended?tot+(vt-endVt)/1000:mediaT();}
+function applyAnimRate(){
+var an;try{an=document.getAnimations();}catch(e){return;}
+for(var i=0;i<an.length;i++){if(an[i].playbackRate!==rate){try{an[i].updatePlaybackRate(rate);}catch(e){}}}
+}
+var stopped=false;
+await new Promise(function(done0){
+function done(){stopped=true;done0();}
+base=_pn();dbase=_dn();vt=0;last=_pn();rate=R0;active=true;window.__expOn=true;
+setRate(R0);
+playVid();
+setRate(R0);
+function tick(){
+if(stopped)return;
+if(window.__expAbort){done();return;}
+requestAnimationFrame(tick);
+var rn=_pn();var ti=rn-lastTickReal;lastTickReal=rn;tiEma=tiEma*0.9+ti*0.1;
+adv();
+applyAnimRate();
+var et=exportTime();
+if(!ended&&(et>=tot-0.02||(hasV&&v.ended))){
+ended=true;endVt=vt;
+try{if(hasV)v.pause();if(hasA)a.pause();}catch(e){}
+isPlaying=false;window.__expT=tot;
+try{if(akFx.endscr&&!akEndShown)akShowEnd(true);}catch(e){}
+et=tot;
+}
+/* stall watchdog: the media must keep moving */
+if(!ended&&(hasV||hasA)){
+if(et>lastEtSeen+0.0005){lastEtSeen=et;lastEtMove=rn;}
+else if(rn-lastEtMove>8000){window.__expAbort='The video/audio stopped playing';done();return;}
+}
+if(et>=tot+holdS){done();return;}
+window.__expLvl=(parseInt(lv[Math.round(et*FPS)],10)||0)/100;
+var started=!(hasV||hasA)||et>0.0005||ended;
+if(started&&et>=nextCap){
+if(busy){skips++;}
+else{
+busy=true;
+AndroidRec.exportFrame(idx,N,Math.round(prevEt*1000));
+idx++;sCaptured++;
+nextCap+=(et>=tot+3)?0.1:1/FPS;
+if(nextCap<et-1/FPS)nextCap=et;
+}
+}
+prevPrevEt=prevEt;prevEt=et;
+ticks++;
+rateSum+=rate;rateN++;
+if(ticks%20===0){
+var cap=0.9*(1000/FPS)/Math.max(tiEma,8);
+var nr=rate;
+if(skips>0)nr=Math.max(0.08,rate*0.8);
+else nr=Math.min(rateMax,cap,rate*1.12);
+if(Math.abs(nr-rate)/rate>0.05)setRate(nr);
+skips=0;
+}
+}
+requestAnimationFrame(tick);
+});
 if(window.__expAbort)throw new Error(window.__expAbort);
+/* let the last copy finish, then close the file */
+var w8=_pn();while(busy&&_pn()-w8<5000)await sleep(20);
+var wall=(_pn()-wall0)/1000;
 var fr=await new Promise(function(res){_finRes=res;AndroidRec.exportEnd();});
 ok=fr.ok;msg=fr.msg||'';
-var wall=(_pn()-wall0)/1000;
-stats=Math.round(wall/idx*1000)+' ms/frame ('+idx+' frames, '+Math.floor(wall/60)+' min '+Math.round(wall%60)+' s; page+seek '+Math.round((wall*1000-sNative)/idx)+' ms, native '+Math.round(sNative/idx)+' ms; '+(fr.stats||'')+')';
+stats=Math.floor(wall/60)+' min '+Math.round(wall%60)+' s for '+Math.round(tot+holdS)+' s of video ('+idx+' frames, avg speed '+(rateSum/Math.max(1,rateN)).toFixed(2)+'x; '+(fr.stats||'')+')';
 }catch(e){ok=false;msg=(e&&e.message)||String(e);try{AndroidRec.exportCancel();}catch(_){}}
-window.__vt=null;window.__expT=null;isPlaying=false;
-try{document.getAnimations().forEach(function(x){try{x.__s=undefined;x.play();}catch(e){}});}catch(e){}
+_frameCb=null;
+active=false;window.__expOn=false;window.__expT=null;
+try{stopVid();}catch(e){}
+try{document.getAnimations().forEach(function(x){try{x.updatePlaybackRate(1);}catch(e){}});}catch(e){}
 try{if(akEndShown)akHideEnd();}catch(e){}
-try{if(v){v.loop=oldLoop;v.muted=false;if(v.src)v.currentTime=0;}if(a){a.muted=false;if(a.src)a.currentTime=0;}}catch(e){}
+try{if(v){v.loop=oldVLoop;v.muted=false;v.playbackRate=1;if(hasV)v.currentTime=0;}if(a){a.loop=oldALoop;a.muted=false;a.playbackRate=1;if(hasA)a.currentTime=0;}}catch(e){}
 try{if(!wasHide&&hideUIOn)toggleHideUI();}catch(e){}
 try{akFx.wake=wasWake;akWake();}catch(e){}
 try{playheadPx=0;updatePlayheadUI();}catch(e){}
